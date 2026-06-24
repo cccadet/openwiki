@@ -18,6 +18,7 @@ import {
   normalizeModelId,
   OPENROUTER_API_KEY_ENV_KEY,
   OPENROUTER_BASE_URL,
+  OPENROUTER_FALLBACK_MODEL_IDS,
   OPENWIKI_MODEL_ID_ENV_KEY,
 } from "../constants.js";
 import { createRunContext, writeLastUpdateMetadata } from "./utils.js";
@@ -48,13 +49,102 @@ export async function runOpenWikiAgent(
   const modelId = resolveModelId(options);
   emitDebug(options, `model=${modelId}`);
 
+  const debugFetchCapture = installOpenRouterDebugFetch(options);
+
+  try {
+    return await runOpenWikiAgentWithModelFallbacks(
+      command,
+      cwd,
+      options,
+      modelId,
+      debugFetchCapture,
+    );
+  } catch (error) {
+    attachOpenRouterDebugInfo(error, debugFetchCapture.getLastFailure());
+    throw error;
+  } finally {
+    debugFetchCapture.restore();
+  }
+}
+
+async function runOpenWikiAgentWithModelFallbacks(
+  command: OpenWikiCommand,
+  cwd: string,
+  options: OpenWikiRunOptions,
+  modelId: string,
+  debugFetchCapture: OpenRouterFetchCapture,
+): Promise<OpenWikiRunResult> {
+  const modelAttempts = createModelRoute(modelId);
+  let lastError: unknown = null;
+
+  for (const [attemptIndex, attemptModelId] of modelAttempts.entries()) {
+    const attemptOptions = createAttemptOptions(options, attemptIndex);
+
+    debugFetchCapture.clearLastFailure();
+
+    if (attemptIndex > 0) {
+      emitDebug(
+        options,
+        `model.retry attempt=${attemptIndex + 1} model=${attemptModelId}`,
+      );
+    }
+
+    try {
+      return await runOpenWikiAgentCore(
+        command,
+        cwd,
+        attemptOptions,
+        attemptModelId,
+      );
+    } catch (error) {
+      const failure = debugFetchCapture.getLastFailure();
+
+      attachOpenRouterDebugInfo(error, failure);
+      lastError = error;
+
+      if (
+        !shouldRetryOpenRouterServerError(
+          failure,
+          attemptIndex,
+          modelAttempts.length,
+        )
+      ) {
+        throw error;
+      }
+
+      emitDebug(
+        options,
+        `model.retrying status=${failure?.response?.status ?? "unknown"} next=${
+          modelAttempts[attemptIndex + 1]
+        }`,
+      );
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("OpenWiki run failed after model fallback attempts.");
+}
+
+async function runOpenWikiAgentCore(
+  command: OpenWikiCommand,
+  cwd: string,
+  options: OpenWikiRunOptions,
+  modelId: string,
+): Promise<OpenWikiRunResult> {
   const context = await createRunContext(command, cwd);
   emitDebug(options, "context=created");
   const model = await createModel(modelId);
+  emitDebug(
+    options,
+    `openrouter.route=fallback models=${JSON.stringify(
+      createModelRoute(modelId),
+    )}`,
+  );
   emitDebug(options, "model=initialized");
   const checkpointer = await createCheckpointer();
   emitDebug(options, `checkpointer=${formatUrlDebugValue(checkpointPath)}`);
-  const threadId = createThreadId(cwd);
+  const threadId = options.threadId ?? createThreadId(cwd, createRunThreadId());
   emitDebug(options, `thread=${threadId}`);
   const agent = createDeepAgent({
     model,
@@ -74,7 +164,7 @@ export async function runOpenWikiAgent(
     messages: [
       {
         role: "user",
-        content: createRunUserMessage(command, context, options),
+        content: createRunUserMessage(command, cwd, context, options),
       },
     ],
   };
@@ -120,10 +210,27 @@ export async function runOpenWikiAgent(
   };
 }
 
+function createAttemptOptions(
+  options: OpenWikiRunOptions,
+  attemptIndex: number,
+): OpenWikiRunOptions {
+  if (attemptIndex === 0) {
+    return options;
+  }
+
+  return {
+    ...options,
+    threadId: options.threadId
+      ? `${options.threadId}-retry-${attemptIndex}`
+      : undefined,
+  };
+}
+
 const checkpointPath = path.join(openWikiEnvDir, "openwiki.sqlite");
 
 function createRunUserMessage(
   command: OpenWikiCommand,
+  cwd: string,
   context: Awaited<ReturnType<typeof createRunContext>>,
   options: OpenWikiRunOptions,
 ): string {
@@ -131,7 +238,20 @@ function createRunUserMessage(
     return options.userMessage.trim();
   }
 
-  return createUserPrompt(command, context, options.userMessage ?? null);
+  return `
+${createUserPrompt(command, context, options.userMessage ?? null)}
+
+Repository root:
+${cwd}
+
+Runtime note:
+- Treat the repository root above as the only project you are documenting.
+- Filesystem tools use a virtual root: / means ${cwd}.
+- For ls, read_file, write_file, edit_file, glob, and grep, use virtual paths such as /README.md, /agent/agents/main.py, and /openwiki/quickstart.md.
+- Do not pass host absolute paths to filesystem tools. A host absolute path will be treated as a virtual path and will write to the wrong location.
+- Shell execute commands run on the host. For execute, use cd ${cwd} before repository commands.
+- Do not search parent directories or unrelated repositories.
+`.trim();
 }
 
 async function createCheckpointer(): Promise<SqliteSaver> {
@@ -154,10 +274,20 @@ async function chmodIfExists(filePath: string, mode: number): Promise<void> {
   }
 }
 
-function createThreadId(cwd: string): string {
+export function createOpenWikiThreadId(cwd = process.cwd()): string {
+  return createThreadId(cwd, createRunThreadId());
+}
+
+function createThreadId(cwd: string, runId: string): string {
   const digest = createHash("sha256").update(path.resolve(cwd)).digest("hex");
 
-  return `openwiki-${digest.slice(0, 32)}`;
+  return `openwiki-${digest.slice(0, 32)}-${runId}`;
+}
+
+function createRunThreadId(): string {
+  return `${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
 }
 
 function emitDebug(options: OpenWikiRunOptions, message: string): void {
@@ -204,15 +334,39 @@ function resolveModelId(options: OpenWikiRunOptions): string {
 }
 
 async function createModel(modelId: string) {
+  const models = createModelRoute(modelId);
+
   return new ChatOpenRouter({
     apiKey: process.env[OPENROUTER_API_KEY_ENV_KEY],
     baseURL: OPENROUTER_BASE_URL,
     model: modelId,
+    models,
+    route: "fallback",
     siteName: "OpenWiki",
   });
 }
 
+function createModelRoute(modelId: string): string[] {
+  return Array.from(new Set([modelId, ...OPENROUTER_FALLBACK_MODEL_IDS]));
+}
+
+function shouldRetryOpenRouterServerError(
+  failure: OpenRouterFetchFailure | null,
+  attemptIndex: number,
+  attemptCount: number,
+): boolean {
+  const status = failure?.response?.status;
+
+  return (
+    attemptIndex < attemptCount - 1 &&
+    typeof status === "number" &&
+    status >= 500 &&
+    status < 600
+  );
+}
+
 type NormalizedStreamEvent = {
+  isSubgraph: boolean;
   mode: string;
   payload: unknown;
 };
@@ -229,6 +383,7 @@ function parseStreamEvent(chunk: unknown): OpenWikiRunEvent | null {
 
     return text.length > 0
       ? {
+          source: streamEvent.isSubgraph ? "subgraph" : "main",
           type: "text",
           text,
         }
@@ -250,7 +405,13 @@ function normalizeStreamEvent(chunk: unknown): NormalizedStreamEvent | null {
 
     const [mode, payload] = normalizeStreamChunk(chunk);
 
-    return typeof mode === "string" ? { mode, payload } : null;
+    return typeof mode === "string"
+      ? {
+          isSubgraph: isSubgraphStreamChunk(chunk),
+          mode,
+          payload,
+        }
+      : null;
   }
 
   if (!isRecord(chunk)) {
@@ -261,6 +422,7 @@ function normalizeStreamEvent(chunk: unknown): NormalizedStreamEvent | null {
 
   if (toolEvent?.startsWith("on_tool_")) {
     return {
+      isSubgraph: false,
       mode: "tools",
       payload: chunk,
     };
@@ -273,6 +435,7 @@ function normalizeStreamEvent(chunk: unknown): NormalizedStreamEvent | null {
   }
 
   return {
+    isSubgraph: false,
     mode: method,
     payload: getProtocolEventPayload(chunk),
   };
@@ -284,6 +447,14 @@ function normalizeStreamChunk(chunk: unknown[]): [unknown, unknown] {
   }
 
   return [chunk[0], chunk[1]];
+}
+
+function isSubgraphStreamChunk(chunk: unknown[]): boolean {
+  if (!Array.isArray(chunk[0]) || chunk.length < 3) {
+    return false;
+  }
+
+  return chunk[0].length > 1;
 }
 
 function extractMessageText(payload: unknown): string {
@@ -742,6 +913,272 @@ function describeValueShape(value: unknown): string {
   }
 
   return typeof value;
+}
+
+type OpenRouterFetchCapture = {
+  clearLastFailure: () => void;
+  getLastFailure: () => OpenRouterFetchFailure | null;
+  restore: () => void;
+};
+
+type OpenRouterFetchFailure = {
+  fetchError?: string;
+  request: OpenRouterRequestSummary;
+  response?: OpenRouterResponseSummary;
+};
+
+type OpenRouterRequestSummary = {
+  bodyBytes?: number;
+  messageChars?: number;
+  messageCount?: number;
+  method: string;
+  model?: string;
+  stream?: boolean;
+  toolCount?: number;
+  toolNames?: string[];
+  url: string;
+};
+
+type OpenRouterResponseSummary = {
+  bodyPreview: string;
+  headers: Record<string, string>;
+  status: number;
+  statusText: string;
+};
+
+const OPENROUTER_DEBUG_PROPERTY = "openRouterDebug";
+const OPENROUTER_DEBUG_BODY_LIMIT = 4_000;
+
+function installOpenRouterDebugFetch(
+  options: OpenWikiRunOptions,
+): OpenRouterFetchCapture {
+  const originalFetch = globalThis.fetch;
+  let lastFailure: OpenRouterFetchFailure | null = null;
+
+  globalThis.fetch = (async (input, init) => {
+    if (!isOpenRouterFetchInput(input)) {
+      return originalFetch(input, init);
+    }
+
+    const request = summarizeOpenRouterRequest(input, init);
+
+    try {
+      const response = await originalFetch(input, init);
+
+      if (!response.ok) {
+        lastFailure = {
+          request,
+          response: {
+            bodyPreview: await readResponseBodyPreview(response),
+            headers: getSafeResponseHeaders(response.headers),
+            status: response.status,
+            statusText: response.statusText,
+          },
+        };
+        emitDebug(
+          options,
+          `openrouter.http status=${response.status} statusText=${JSON.stringify(
+            response.statusText,
+          )}`,
+        );
+      }
+
+      return response;
+    } catch (error) {
+      lastFailure = {
+        fetchError: error instanceof Error ? error.message : String(error),
+        request,
+      };
+      throw error;
+    }
+  }) satisfies typeof fetch;
+
+  return {
+    clearLastFailure: () => {
+      lastFailure = null;
+    },
+    getLastFailure: () => lastFailure,
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+function attachOpenRouterDebugInfo(
+  error: unknown,
+  failure: OpenRouterFetchFailure | null,
+): void {
+  if (!failure || !isRecord(error)) {
+    return;
+  }
+
+  error[OPENROUTER_DEBUG_PROPERTY] = failure;
+}
+
+function isOpenRouterFetchInput(input: Parameters<typeof fetch>[0]): boolean {
+  const url = getFetchInputUrl(input);
+
+  return (
+    url !== null &&
+    url.startsWith(OPENROUTER_BASE_URL) &&
+    url.includes("/chat/completions")
+  );
+}
+
+function getFetchInputUrl(input: Parameters<typeof fetch>[0]): string | null {
+  if (typeof input === "string") {
+    return input;
+  }
+
+  if (input instanceof URL) {
+    return input.toString();
+  }
+
+  return "url" in input && typeof input.url === "string" ? input.url : null;
+}
+
+function summarizeOpenRouterRequest(
+  input: Parameters<typeof fetch>[0],
+  init: Parameters<typeof fetch>[1],
+): OpenRouterRequestSummary {
+  const body = typeof init?.body === "string" ? init.body : null;
+  const parsedBody = parseJsonRecord(body);
+  const toolNames = getOpenRouterToolNames(parsedBody?.tools);
+
+  return {
+    bodyBytes: body === null ? undefined : Buffer.byteLength(body, "utf8"),
+    messageChars: getOpenRouterMessageChars(parsedBody?.messages),
+    messageCount: Array.isArray(parsedBody?.messages)
+      ? parsedBody.messages.length
+      : undefined,
+    method: init?.method ?? "GET",
+    model: typeof parsedBody?.model === "string" ? parsedBody.model : undefined,
+    stream:
+      typeof parsedBody?.stream === "boolean" ? parsedBody.stream : undefined,
+    toolCount: toolNames.length,
+    toolNames: toolNames.slice(0, 20),
+    url: formatOpenRouterDebugUrl(getFetchInputUrl(input) ?? "unknown"),
+  };
+}
+
+function parseJsonRecord(value: string | null): Record<string, unknown> | null {
+  if (value === null) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function getOpenRouterToolNames(tools: unknown): string[] {
+  if (!Array.isArray(tools)) {
+    return [];
+  }
+
+  return tools
+    .map((tool) => {
+      if (!isRecord(tool) || !isRecord(tool.function)) {
+        return null;
+      }
+
+      return typeof tool.function.name === "string" ? tool.function.name : null;
+    })
+    .filter((name): name is string => name !== null);
+}
+
+function getOpenRouterMessageChars(messages: unknown): number | undefined {
+  if (!Array.isArray(messages)) {
+    return undefined;
+  }
+
+  return messages.reduce((total, message) => {
+    if (!isRecord(message)) {
+      return total;
+    }
+
+    return total + countMessageContentChars(message.content);
+  }, 0);
+}
+
+function countMessageContentChars(content: unknown): number {
+  if (typeof content === "string") {
+    return content.length;
+  }
+
+  if (Array.isArray(content)) {
+    return content.reduce(
+      (total, block) => total + countMessageContentChars(block),
+      0,
+    );
+  }
+
+  if (!isRecord(content)) {
+    return 0;
+  }
+
+  return Object.entries(content).reduce((total, [key, value]) => {
+    if (key === "text" || key === "content") {
+      return total + countMessageContentChars(value);
+    }
+
+    return total;
+  }, 0);
+}
+
+async function readResponseBodyPreview(response: Response): Promise<string> {
+  try {
+    const body = await response.clone().text();
+    const sanitizedBody = sanitizeOpenRouterResponseBody(body);
+
+    return sanitizedBody.length <= OPENROUTER_DEBUG_BODY_LIMIT
+      ? sanitizedBody
+      : `${sanitizedBody.slice(0, OPENROUTER_DEBUG_BODY_LIMIT - 3)}...`;
+  } catch (error) {
+    return `Unable to read response body: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+  }
+}
+
+function sanitizeOpenRouterResponseBody(body: string): string {
+  return body.replace(
+    /"([^"]*(?:api[-_]?key|authorization|bearer|password|secret|token|user_id)[^"]*)"\s*:\s*"[^"]*"/giu,
+    (_, key: string) => `${JSON.stringify(key)}:"[REDACTED]"`,
+  );
+}
+
+function getSafeResponseHeaders(headers: Headers): Record<string, string> {
+  const safeHeaders: Record<string, string> = {};
+
+  for (const key of ["cf-ray", "content-type", "request-id", "x-request-id"]) {
+    const value = headers.get(key);
+
+    if (value) {
+      safeHeaders[key] = value;
+    }
+  }
+
+  return safeHeaders;
+}
+
+function formatOpenRouterDebugUrl(value: string): string {
+  try {
+    const url = new URL(value);
+
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+
+    return url.toString();
+  } catch {
+    return value;
+  }
 }
 
 function formatEnvironmentDebug(): string {

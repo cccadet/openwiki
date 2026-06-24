@@ -20,16 +20,9 @@ export async function createRunContext(
     };
   }
 
-  if (command === "init") {
-    return {
-      lastUpdate,
-      gitSummary: "Not applicable for init.",
-    };
-  }
-
   return {
     lastUpdate,
-    gitSummary: await createGitSummary(cwd, lastUpdate),
+    gitSummary: await createGitSummary(command, cwd, lastUpdate),
   };
 }
 
@@ -42,6 +35,7 @@ export async function writeLastUpdateMetadata(
   const metadata: UpdateMetadata = {
     updatedAt: new Date().toISOString(),
     command,
+    gitHead: await getGitHead(cwd),
     model: modelId,
   };
 
@@ -68,6 +62,10 @@ async function readLastUpdate(cwd: string): Promise<UpdateMetadata | null> {
       return {
         updatedAt: parsedMetadata.updatedAt,
         command: parsedMetadata.command === "init" ? "init" : "update",
+        gitHead:
+          typeof parsedMetadata.gitHead === "string"
+            ? parsedMetadata.gitHead
+            : undefined,
         model: parsedMetadata.model,
       };
     }
@@ -83,15 +81,44 @@ async function readLastUpdate(cwd: string): Promise<UpdateMetadata | null> {
 }
 
 async function createGitSummary(
+  command: OpenWikiCommand,
   cwd: string,
   lastUpdate: UpdateMetadata | null,
 ): Promise<string> {
   const sections: string[] = [];
   const status = await runGit(cwd, ["status", "--short"]);
+  const head = await getGitHead(cwd);
+  const recentLog = await runGit(cwd, [
+    "log",
+    "--max-count=20",
+    "--name-status",
+    "--oneline",
+  ]);
 
   sections.push(formatGitSection("git status --short", status));
+  sections.push(formatGitSection("git rev-parse HEAD", head ?? "(unknown)"));
+  sections.push(
+    formatGitSection(
+      "git log --max-count=20 --name-status --oneline",
+      recentLog,
+    ),
+  );
 
-  if (lastUpdate?.updatedAt) {
+  if (command === "update" && lastUpdate?.gitHead) {
+    const logSinceLastHead = await runGit(cwd, [
+      "log",
+      `${lastUpdate.gitHead}..HEAD`,
+      "--name-status",
+      "--oneline",
+    ]);
+
+    sections.push(
+      formatGitSection(
+        `git log ${lastUpdate.gitHead}..HEAD --name-status --oneline`,
+        logSinceLastHead,
+      ),
+    );
+  } else if (command === "update" && lastUpdate?.updatedAt) {
     const logSinceLastUpdate = await runGit(cwd, [
       "log",
       "--since",
@@ -106,7 +133,7 @@ async function createGitSummary(
         logSinceLastUpdate,
       ),
     );
-  } else {
+  } else if (command === "update") {
     sections.push("No prior OpenWiki update timestamp was found.");
   }
 
@@ -114,6 +141,12 @@ async function createGitSummary(
   sections.push(formatGitSection("git diff --name-status HEAD", diff));
 
   return sections.join("\n\n");
+}
+
+async function getGitHead(cwd: string): Promise<string | undefined> {
+  const head = await runGit(cwd, ["rev-parse", "HEAD"]);
+
+  return head.length > 0 ? head : undefined;
 }
 
 async function runGit(cwd: string, args: string[]): Promise<string> {

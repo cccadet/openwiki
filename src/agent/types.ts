@@ -7,6 +7,7 @@ export type OpenWikiRunResult = {
 
 export type OpenWikiRunEvent =
   | {
+      source?: "main" | "subgraph";
       type: "text";
       text: string;
     }
@@ -33,12 +34,14 @@ export type OpenWikiRunOptions = {
   isFollowup?: boolean;
   modelId?: string | null;
   onEvent?: (event: OpenWikiRunEvent) => void;
+  threadId?: string;
   userMessage?: string | null;
 };
 
 export type UpdateMetadata = {
   updatedAt: string;
   command: OpenWikiCommand;
+  gitHead?: string;
   model: string;
 };
 

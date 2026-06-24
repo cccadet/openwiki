@@ -5,6 +5,11 @@ export const OPENWIKI_MODEL_ID_ENV_KEY = "OPENWIKI_MODEL_ID";
 export const DEFAULT_MODEL_ID = "z-ai/glm-5.2";
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
+export const OPENROUTER_FALLBACK_MODEL_IDS = [
+  "openai/gpt-5.4-mini",
+  "anthropic/claude-sonnet-4-6",
+];
+
 export const SUGGESTED_MODEL_IDS = [
   DEFAULT_MODEL_ID,
   "openrouter/fusion",

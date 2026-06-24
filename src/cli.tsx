@@ -20,7 +20,7 @@ import {
   saveOpenWikiEnv,
   type CredentialDiagnostic,
 } from "./env.js";
-import { runOpenWikiAgent } from "./agent/index.js";
+import { createOpenWikiThreadId, runOpenWikiAgent } from "./agent/index.js";
 import {
   type OpenWikiRunEvent,
   type OpenWikiRunResult,
@@ -96,6 +96,7 @@ function App({ command }: AppProps) {
     startupModelId,
   );
   const activeRunId = useRef(0);
+  const sessionThreadId = useRef(createOpenWikiThreadId(process.cwd()));
   const mountedRef = useRef(false);
   const nextLogId = useRef(1);
   const nextCompletedRunId = useRef(1);
@@ -144,6 +145,20 @@ function App({ command }: AppProps) {
     setActiveUserMessage(message);
     setActiveMessageIsFollowup(false);
     setResolvedCommand(nextCommand);
+    setRunState({ status: "idle" });
+  }
+
+  function clearSession() {
+    activeRunId.current += 1;
+    sessionThreadId.current = createOpenWikiThreadId(process.cwd());
+    activeRunCredentialDiagnostics.current = undefined;
+    activeRunLog.current = [];
+    nextLogId.current = 1;
+    nextCompletedRunId.current = 1;
+    setCompletedRuns([]);
+    setActiveUserMessage(null);
+    setActiveMessageIsFollowup(false);
+    setResolvedCommand(null);
     setRunState({ status: "idle" });
   }
 
@@ -237,6 +252,7 @@ function App({ command }: AppProps) {
       debug: isDebugMode(),
       isFollowup: activeMessageIsFollowup,
       modelId: sessionModelId,
+      threadId: sessionThreadId.current,
       userMessage: activeUserMessage,
       onEvent: (event) => {
         if (!mountedRef.current || activeRunId.current !== runId) {
@@ -416,6 +432,7 @@ function App({ command }: AppProps) {
         <ChatHistory runs={completedRuns} />
         <ChatInput
           currentModelId={getDisplayModelId(displayModelId)}
+          onClear={clearSession}
           onCommandRun={submitCommandRun}
           onModelSelect={selectModel}
           onSubmit={submitChatMessage}
@@ -457,6 +474,7 @@ function App({ command }: AppProps) {
       <Header modelId={displayModelId} subtitle="Ready for chat" />
       <ChatInput
         currentModelId={getDisplayModelId(displayModelId)}
+        onClear={clearSession}
         onCommandRun={submitCommandRun}
         onModelSelect={selectModel}
         onSubmit={submitChatMessage}
@@ -716,9 +734,8 @@ function RunView({
   modelId = null,
 }: RunViewProps) {
   const [animationFrame, setAnimationFrame] = useState(0);
-  const hasRunningTool = log.some(
-    (item) => item.type === "tool" && item.status === "running",
-  );
+  const activeRunningToolId = getActiveRunningToolLogId(log);
+  const hasRunningTool = activeRunningToolId !== null;
 
   useEffect(() => {
     if (done || !hasRunningTool) {
@@ -752,6 +769,7 @@ function RunView({
           {log.length > 0 ? (
             log.map((item) => (
               <RunLogLine
+                activeRunningToolId={activeRunningToolId}
                 animationFrame={animationFrame}
                 item={item}
                 key={item.id}
@@ -770,26 +788,29 @@ function RunView({
 }
 
 function RunLogLine({
+  activeRunningToolId = null,
   animationFrame = 0,
   item,
 }: {
+  activeRunningToolId?: number | null;
   animationFrame?: number;
   item: RunLogItem;
 }) {
   if (item.type === "tool") {
     if (item.status === "running") {
+      const isActive = item.id === activeRunningToolId;
+
       return (
         <Box flexDirection="column" marginBottom={1}>
           <Text>
-            <Text bold color="cyan">
-              {">> "}
+            <Text color={isActive ? "cyan" : "gray"}>
+              {isActive ? `${getSpinnerFrame(animationFrame)} ` : "* "}
             </Text>
-            <AnimatedToolText
-              frame={animationFrame + item.id}
-              text={item.content}
-            />
+            <Text bold={isActive} color={isActive ? "cyan" : "gray"}>
+              {item.content}
+            </Text>
           </Text>
-          {item.call ? (
+          {isActive && item.call ? (
             <Text color="gray"> {truncateLogOutput(item.call, "")}</Text>
           ) : null}
         </Box>
@@ -814,7 +835,7 @@ function RunLogLine({
     return (
       <Box flexDirection="column" marginBottom={1}>
         <Text>
-          <Text color="gray">{"ok "}</Text>
+          <Text color="green">{"* "}</Text>
           <Text color="gray">{item.content}</Text>
         </Text>
       </Box>
@@ -840,34 +861,22 @@ function RunLogLine({
   );
 }
 
-function AnimatedToolText({ frame, text }: { frame: number; text: string }) {
-  const highlightIndex = frame % Math.max(text.length + 6, 1);
+function getActiveRunningToolLogId(log: RunLogItem[]): number | null {
+  for (let index = log.length - 1; index >= 0; index -= 1) {
+    const item = log[index];
 
-  return (
-    <>
-      {Array.from(text).map((character, index) => {
-        const distance = Math.abs(index - highlightIndex);
-        const color =
-          distance === 0
-            ? "white"
-            : distance === 1
-              ? "cyan"
-              : distance === 2
-                ? "yellow"
-                : "gray";
+    if (item.type === "tool" && item.status === "running") {
+      return item.id;
+    }
+  }
 
-        return (
-          <Text
-            bold={distance <= 1}
-            color={color}
-            key={`${index}-${character}`}
-          >
-            {character}
-          </Text>
-        );
-      })}
-    </>
-  );
+  return null;
+}
+
+function getSpinnerFrame(frame: number): string {
+  const frames = ["-", "\\", "|", "/"];
+
+  return frames[frame % frames.length] ?? "-";
 }
 
 function MarkdownText({ markdown }: { markdown: string }) {
@@ -1082,6 +1091,7 @@ function ChatHistory({ runs }: { runs: CompletedRun[] }) {
 
 type ChatInputProps = {
   currentModelId: string;
+  onClear: () => void;
   onCommandRun: (
     command: Extract<OpenWikiCommand, "init" | "update">,
     message: string | null,
@@ -1092,6 +1102,7 @@ type ChatInputProps = {
 
 function ChatInput({
   currentModelId,
+  onClear,
   onCommandRun,
   onModelSelect,
   onSubmit,
@@ -1257,10 +1268,17 @@ function ChatInput({
       return;
     }
 
+    if (option.id === "clear") {
+      resetInput();
+      onClear();
+      setNotice("Started a new chat thread.");
+      return;
+    }
+
     if (option.id === "help") {
       resetInput();
       setNotice(
-        "Slash commands: /model, /init, /update, /help, /exit. Use arrows to select.",
+        "Slash commands: /model, /init, /update, /clear, /help, /exit. Use arrows to select.",
       );
       return;
     }
@@ -1379,7 +1397,7 @@ type ChatInputMenuState =
   | { kind: "model"; selectedIndex: number }
   | { kind: "none" };
 
-type SlashCommandId = "exit" | "help" | "init" | "model" | "update";
+type SlashCommandId = "clear" | "exit" | "help" | "init" | "model" | "update";
 
 type SlashCommandOption = {
   description: string;
@@ -1413,6 +1431,11 @@ const slashCommandOptions: SlashCommandOption[] = [
     description: "Update existing OpenWiki documentation",
     id: "update",
     label: "/update",
+  },
+  {
+    description: "Start a fresh thread and clear chat history",
+    id: "clear",
+    label: "/clear",
   },
   {
     description: "Show slash command help",
@@ -1780,6 +1803,10 @@ function appendRunLogEvent(
   event: OpenWikiRunEvent,
   nextLogId: React.MutableRefObject<number>,
 ): RunLogItem[] {
+  if (event.type === "text" && event.source === "subgraph") {
+    return log;
+  }
+
   if (event.type === "text" && event.text.length === 0) {
     return log;
   }
@@ -2136,13 +2163,10 @@ function getDisplayModelId(modelId: string | null): string {
 }
 
 function getErrorDiagnostics(error: unknown): ErrorDiagnostic[] {
-  if (!isDebugMode()) {
-    return [];
-  }
-
   const diagnostics: ErrorDiagnostic[] = [];
+  const debugMode = isDebugMode();
 
-  if (error instanceof Error) {
+  if (debugMode && error instanceof Error) {
     diagnostics.push(
       { label: "name", value: error.name },
       { label: "message", value: sanitizeDiagnosticText(error.message) },
@@ -2162,10 +2186,15 @@ function getErrorDiagnostics(error: unknown): ErrorDiagnostic[] {
     return diagnostics;
   }
 
-  addSafeObjectDiagnostics(diagnostics, error, "");
-  addSafeNestedDiagnostics(diagnostics, error, "cause");
-  addSafeNestedDiagnostics(diagnostics, error, "error");
-  addSafeNestedDiagnostics(diagnostics, error, "response");
+  addOpenRouterMetadataDiagnostics(diagnostics, error, "");
+  addAttachedDebugDiagnostics(diagnostics, error, "");
+
+  if (debugMode) {
+    addSafeObjectDiagnostics(diagnostics, error, "");
+    addSafeNestedDiagnostics(diagnostics, error, "cause");
+    addSafeNestedDiagnostics(diagnostics, error, "error");
+    addSafeNestedDiagnostics(diagnostics, error, "response");
+  }
 
   return dedupeDiagnostics(diagnostics);
 }
@@ -2182,6 +2211,8 @@ function addSafeNestedDiagnostics(
   }
 
   addSafeObjectDiagnostics(diagnostics, nested, key);
+  addOpenRouterMetadataDiagnostics(diagnostics, nested, key);
+  addAttachedDebugDiagnostics(diagnostics, nested, key);
 }
 
 function addSafeObjectDiagnostics(
@@ -2211,6 +2242,146 @@ function addSafeObjectDiagnostics(
   }
 
   addSafeHeaderDiagnostics(diagnostics, value.headers, prefix);
+}
+
+function addAttachedDebugDiagnostics(
+  diagnostics: ErrorDiagnostic[],
+  value: Record<string, unknown>,
+  prefix: string,
+): void {
+  const debugValue = value.openRouterDebug;
+
+  if (debugValue === undefined || debugValue === null) {
+    return;
+  }
+
+  diagnostics.push({
+    label: prefix ? `${prefix}.openRouterDebug` : "openRouterDebug",
+    value: formatDiagnosticMetadataValue(debugValue),
+  });
+}
+
+function addOpenRouterMetadataDiagnostics(
+  diagnostics: ErrorDiagnostic[],
+  value: Record<string, unknown>,
+  prefix: string,
+): void {
+  const metadata = value.metadata;
+
+  if (!isRecord(metadata)) {
+    return;
+  }
+
+  for (const key of ["provider_name", "is_byok", "finish_reason"]) {
+    const property = metadata[key];
+
+    if (isDiagnosticValue(property)) {
+      diagnostics.push({
+        label: prefix ? `${prefix}.metadata.${key}` : `metadata.${key}`,
+        value: sanitizeDiagnosticText(String(property)),
+      });
+    }
+  }
+
+  addMetadataValueDiagnostic(diagnostics, metadata, "raw", prefix);
+  addPreviousErrorDiagnostics(diagnostics, metadata.previous_errors, prefix);
+}
+
+function addMetadataValueDiagnostic(
+  diagnostics: ErrorDiagnostic[],
+  metadata: Record<string, unknown>,
+  key: string,
+  prefix: string,
+): void {
+  const value = metadata[key];
+
+  if (value === undefined || value === null) {
+    return;
+  }
+
+  diagnostics.push({
+    label: prefix ? `${prefix}.metadata.${key}` : `metadata.${key}`,
+    value: formatDiagnosticMetadataValue(value),
+  });
+}
+
+function addPreviousErrorDiagnostics(
+  diagnostics: ErrorDiagnostic[],
+  previousErrors: unknown,
+  prefix: string,
+): void {
+  if (!Array.isArray(previousErrors)) {
+    return;
+  }
+
+  previousErrors.slice(0, 5).forEach((previousError, index) => {
+    diagnostics.push({
+      label: prefix
+        ? `${prefix}.metadata.previous_errors.${index}`
+        : `metadata.previous_errors.${index}`,
+      value: formatDiagnosticMetadataValue(previousError),
+    });
+  });
+
+  if (previousErrors.length > 5) {
+    diagnostics.push({
+      label: prefix
+        ? `${prefix}.metadata.previous_errors.more`
+        : "metadata.previous_errors.more",
+      value: `${previousErrors.length - 5} more previous provider errors`,
+    });
+  }
+}
+
+function formatDiagnosticMetadataValue(value: unknown): string {
+  if (isDiagnosticValue(value)) {
+    return truncateDiagnosticValue(sanitizeDiagnosticText(String(value)));
+  }
+
+  return truncateDiagnosticValue(sanitizeDiagnosticText(safeStringify(value)));
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, createDiagnosticJsonReplacer(), 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function createDiagnosticJsonReplacer() {
+  const seen = new WeakSet<object>();
+
+  return (key: string, value: unknown) => {
+    if (isSecretLikeKey(key)) {
+      return "[REDACTED]";
+    }
+
+    if (typeof value === "object" && value !== null) {
+      if (seen.has(value)) {
+        return "[Circular]";
+      }
+
+      seen.add(value);
+    }
+
+    return value;
+  };
+}
+
+function isSecretLikeKey(key: string): boolean {
+  return /api[-_]?key|authorization|bearer|token|secret|password/iu.test(key);
+}
+
+function truncateDiagnosticValue(value: string): string {
+  const maxLength = 2_000;
+  const normalizedValue = value.trim();
+
+  if (normalizedValue.length <= maxLength) {
+    return normalizedValue;
+  }
+
+  return `${normalizedValue.slice(0, maxLength - 3)}...`;
 }
 
 function addSafeHeaderDiagnostics(
@@ -2288,7 +2459,30 @@ function getErrorMessage(error: unknown): string {
   const message =
     error instanceof Error ? error.message : "OpenWiki agent run failed.";
 
+  if (isOpenRouterServerError(error, message)) {
+    return "OpenRouter/provider returned 500 Internal Server Error. Try retrying or switching models with /model. Run with OPENWIKI_DEBUG=1 to show provider metadata.";
+  }
+
   return sanitizeDiagnosticText(message);
+}
+
+function isOpenRouterServerError(error: unknown, message: string): boolean {
+  if (isRecord(error)) {
+    const status = error.statusCode ?? error.status;
+    const name = error instanceof Error ? error.name : null;
+
+    if (
+      (status === 500 || status === "500") &&
+      (name === "OpenRouterError" || "metadata" in error)
+    ) {
+      return true;
+    }
+  }
+
+  return /OpenRouterError/iu.test(String(error)) ||
+    /Internal Server Error/iu.test(message)
+    ? /\b500\b|Internal Server Error/iu.test(message)
+    : false;
 }
 
 function sanitizeDiagnosticText(value: string): string {
@@ -2416,12 +2610,13 @@ async function runPrintCommand(
     const output: string[] = [];
 
     await runOpenWikiAgent(command.command, process.cwd(), {
-      debug: false,
+      debug: isDebugMode(),
       isFollowup: command.command === "chat",
       modelId: command.modelId,
+      threadId: createOpenWikiThreadId(process.cwd()),
       userMessage: command.userMessage,
       onEvent: (event) => {
-        if (event.type === "text") {
+        if (event.type === "text" && event.source !== "subgraph") {
           output.push(event.text);
         }
       },
@@ -2436,7 +2631,22 @@ async function runPrintCommand(
     process.exitCode = 0;
   } catch (error) {
     process.stderr.write(`${getErrorMessage(error)}\n`);
+    writePrintErrorDiagnostics(error);
     process.exitCode = 1;
+  }
+}
+
+function writePrintErrorDiagnostics(error: unknown): void {
+  const diagnostics = getErrorDiagnostics(error);
+
+  if (diagnostics.length === 0) {
+    return;
+  }
+
+  process.stderr.write("\nError Diagnostics\n");
+
+  for (const diagnostic of diagnostics) {
+    process.stderr.write(`${diagnostic.label}: ${diagnostic.value}\n`);
   }
 }
 

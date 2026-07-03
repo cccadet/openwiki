@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.serena/
+package-lock.json
 
 *.log
 .DS_Store

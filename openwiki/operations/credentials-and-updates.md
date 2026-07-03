@@ -19,9 +19,10 @@ The file stores provider configuration and API keys:
 - `OPENWIKI_PROVIDER` — the selected model provider
 - `OPENWIKI_MODEL_ID` — the default model ID
 - Provider API keys: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `BASETEN_API_KEY`, `FIREWORKS_API_KEY`
+- Optional OpenAI-compatible endpoint: `OPENAI_BASE_URL`
 - Optional LangSmith settings: `LANGSMITH_API_KEY`, `LANGCHAIN_PROJECT`, `LANGCHAIN_TRACING_V2`
 
-The loader merges those values into `process.env`, while preferring existing process-level values over file values. Deprecated keys (`OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT`) are skipped on load and removed on save.
+The loader merges those values into `process.env`, while preferring existing process-level values over file values. Deprecated keys (`OPENAI_ORG_ID`, `OPENAI_PROJECT`) are skipped on load and removed on save.
 
 `src/credentials.tsx` provides the interactive bootstrap flow when required:
 
@@ -30,7 +31,7 @@ The loader merges those values into `process.env`, while preferring existing pro
 - prompts for a model choice (arrow-key selection from the provider's model list, or a custom model ID),
 - optionally prompts for a LangSmith key,
 - writes the results with restrictive file permissions,
-- removes deprecated OpenAI-related environment variables when saving.
+- removes deprecated OpenAI-related environment variables (`OPENAI_ORG_ID`, `OPENAI_PROJECT`) when saving.
 
 The setup flow runs for **all** interactive commands (chat, init, and update) when credentials are missing — not just chat. In non-interactive mode (no TTY or `--print`), missing provider keys produce an error instead of a prompt.
 
@@ -56,7 +57,7 @@ The env layer also produces diagnostics for the CLI UI. Those diagnostics report
 - invalid model IDs,
 - invalid provider values.
 
-Diagnostics cover all five provider keys plus `OPENWIKI_PROVIDER`, `OPENWIKI_MODEL_ID`, and `LANGSMITH_API_KEY`. This makes startup problems easier to diagnose without exposing secret values.
+Diagnostics cover all five provider keys plus `OPENAI_BASE_URL`, `OPENWIKI_PROVIDER`, `OPENWIKI_MODEL_ID`, and `LANGSMITH_API_KEY`. This makes startup problems easier to diagnose without exposing secret values.
 
 ## Update metadata
 

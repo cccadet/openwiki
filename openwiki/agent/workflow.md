@@ -25,7 +25,8 @@ Chat runs skip metadata writes entirely.
 
 - **anthropic**: `new ChatAnthropic(modelId, { apiKey })` — uses `@langchain/anthropic` directly.
 - **openrouter**: `new ChatOpenRouter({ apiKey, baseURL, model, models, route: "fallback", siteName: "OpenWiki" })` — passes a fallback model list so OpenRouter can route around server-side failures.
-- **baseten / fireworks / openai**: `new ChatOpenAI({ apiKey, configuration: { baseURL? }, model })` — OpenAI-compatible clients using the provider's custom base URL when configured.
+- **openai**: `new ChatOpenAI({ apiKey, configuration: { baseURL? }, model })` — uses `OPENAI_BASE_URL` from the environment when set, otherwise calls the default OpenAI endpoint.
+- **baseten / fireworks**: `new ChatOpenAI({ apiKey, configuration: { baseURL? }, model })` — OpenAI-compatible clients using the provider's custom base URL from `PROVIDER_CONFIGS`.
 
 ## Prompting strategy
 

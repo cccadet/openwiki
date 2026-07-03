@@ -25,6 +25,7 @@ import {
   isValidModelId,
   normalizeModelId,
   OPENAI_API_KEY_ENV_KEY,
+  OPENAI_BASE_URL_ENV_KEY,
   OPENROUTER_API_KEY_ENV_KEY,
   OPENROUTER_BASE_URL,
   OPENROUTER_FALLBACK_MODEL_IDS,
@@ -394,6 +395,20 @@ async function createModel(provider: OpenWikiProvider, modelId: string) {
       models,
       route: "fallback",
       siteName: "OpenWiki",
+    });
+  }
+
+  if (provider === "openai") {
+    const baseURL = process.env[OPENAI_BASE_URL_ENV_KEY];
+
+    return new ChatOpenAI({
+      apiKey: process.env[OPENAI_API_KEY_ENV_KEY],
+      configuration: baseURL
+        ? {
+            baseURL,
+          }
+        : undefined,
+      model: modelId,
     });
   }
 
@@ -1262,6 +1277,7 @@ function formatEnvironmentDebug(): string {
     BASETEN_API_KEY_ENV_KEY,
     FIREWORKS_API_KEY_ENV_KEY,
     OPENAI_API_KEY_ENV_KEY,
+    OPENAI_BASE_URL_ENV_KEY,
     ANTHROPIC_API_KEY_ENV_KEY,
     OPENROUTER_API_KEY_ENV_KEY,
     OPENWIKI_MODEL_ID_ENV_KEY,
@@ -1280,7 +1296,7 @@ function formatDebugValue(key: string, value: string | undefined): string {
     return "unset";
   }
 
-  if (key === "LANGCHAIN_ENDPOINT") {
+  if (key === "LANGCHAIN_ENDPOINT" || key.endsWith("_BASE_URL")) {
     return formatUrlDebugValue(value);
   }
 
